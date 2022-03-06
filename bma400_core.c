@@ -793,6 +793,19 @@ static const struct iio_info bma400_info = {
 	.write_raw_get_fmt = bma400_write_raw_get_fmt,
 };
 
+static void bma400_disable(void *data_ptr)
+{
+	struct bma400_data *data = data_ptr;
+	int ret;
+
+	ret = bma400_set_power_mode(data, POWER_MODE_SLEEP);
+	if (ret)
+		dev_warn(data->dev, "Failed to put device into sleep mode (%pe)\n",
+			 ERR_PTR(ret));
+
+	regulator_bulk_disable(ARRAY_SIZE(data->regulators), data->regulators);
+}
+
 int bma400_probe(struct device *dev, struct regmap *regmap, const char *name)
 {
 	struct iio_dev *indio_dev;
@@ -822,12 +835,16 @@ int bma400_probe(struct device *dev, struct regmap *regmap, const char *name)
 	indio_dev->num_channels = ARRAY_SIZE(bma400_channels);
 	indio_dev->modes = INDIO_DIRECT_MODE;
 
-	dev_set_drvdata(dev, indio_dev);
+	//dev_set_drvdata(dev, indio_dev);
+        ret = devm_add_action_or_reset(dev, bma400_disable, data);
+        if (ret < 0)
+                return ret;
 
-	return iio_device_register(indio_dev);
+	return devm_iio_device_register(dev, indio_dev);
 }
 EXPORT_SYMBOL(bma400_probe);
 
+/*
 void bma400_remove(struct device *dev)
 {
 	struct iio_dev *indio_dev = dev_get_drvdata(dev);
@@ -847,6 +864,7 @@ void bma400_remove(struct device *dev)
 	iio_device_unregister(indio_dev);
 }
 EXPORT_SYMBOL(bma400_remove);
+*/
 
 MODULE_AUTHOR("Dan Robertson <dan@dlrobertson.com>");
 MODULE_DESCRIPTION("Bosch BMA400 triaxial acceleration sensor core");
