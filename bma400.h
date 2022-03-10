@@ -53,7 +53,7 @@
 #define BMA400_STEP_CNT1_REG        0x16
 #define BMA400_STEP_CNT3_REG        0x17
 #define BMA400_STEP_STAT_REG        0x18
-
+#define BMA400_STEP_INT_MSK	    BIT(0)
 /*
  * Read-write configuration registers
  */
