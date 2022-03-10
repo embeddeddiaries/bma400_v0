@@ -20,6 +20,12 @@
 #include <linux/mutex.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
+#include <linux/bits.h>
+#include <linux/bitfield.h>
+#include <linux/iio/buffer.h>
+#include <linux/iio/trigger.h>
+#include <linux/iio/triggered_buffer.h>
+#include <linux/iio/trigger_consumer.h>
 
 #include "bma400.h"
 
@@ -61,6 +67,13 @@ struct bma400_data {
 	struct bma400_sample_freq sample_freq;
 	int oversampling_ratio;
 	int scale;
+	struct iio_trigger *trig;
+	/* Correct time stamp alignment */
+	struct {
+		__be16 buff[3];
+		u8 temperature;
+                s64 ts __aligned(8);
+	}buffer;
 };
 
 static bool bma400_is_writable_reg(struct device *dev, unsigned int reg)
@@ -152,7 +165,7 @@ static const struct iio_chan_spec_ext_info bma400_ext_info[] = {
 	{ }
 };
 
-#define BMA400_ACC_CHANNEL(_axis) { \
+#define BMA400_ACC_CHANNEL(_index, _axis) { \
 	.type = IIO_ACCEL, \
 	.modified = 1, \
 	.channel2 = IIO_MOD_##_axis, \
@@ -164,17 +177,32 @@ static const struct iio_chan_spec_ext_info bma400_ext_info[] = {
 		BIT(IIO_CHAN_INFO_SCALE) | \
 		BIT(IIO_CHAN_INFO_OVERSAMPLING_RATIO), \
 	.ext_info = bma400_ext_info, \
+	.scan_index = _index,	\
+	.scan_type = {		\
+		.sign = 's',	\
+		.realbits = 12,		\
+		.storagebits = 16,	\
+		.endianness = IIO_LE,	\
+	},				\
 }
 
 static const struct iio_chan_spec bma400_channels[] = {
-	BMA400_ACC_CHANNEL(X),
-	BMA400_ACC_CHANNEL(Y),
-	BMA400_ACC_CHANNEL(Z),
+	BMA400_ACC_CHANNEL(0, X),
+	BMA400_ACC_CHANNEL(1, Y),
+	BMA400_ACC_CHANNEL(2, Z),
 	{
 		.type = IIO_TEMP,
 		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
 		.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SAMP_FREQ),
+		.scan_index = 3,
+		.scan_type = {
+			.sign = 's',
+			.realbits = 8,
+			.storagebits = 8,
+			.endianness = IIO_LE,
+		},
 	},
+	IIO_CHAN_SOFT_TIMESTAMP(4),
 };
 
 static int bma400_get_temp_reg(struct bma400_data *data, int *val, int *val2)
@@ -507,6 +535,23 @@ static int bma400_get_power_mode(struct bma400_data *data)
 	return 0;
 }
 
+static int bma400_int_drdy_config(struct bma400_data *data)
+{
+	int ret;
+
+	ret = regmap_update_bits(data->regmap, BMA400_INT_CONFIG0_REG,
+                                 BMA400_INT_DRDY_MSK,
+                                 FIELD_PREP(BMA400_INT_DRDY_MSK, 1));
+	//ret = regmap_write(data->regmap, BMA400_INT_CONFIG0_REG, 0x80);
+	if (ret)
+		return ret;
+
+        ret = regmap_write(data->regmap, BMA400_INT_IO_CTRL_REG, 0x02);
+	if (ret)
+		return ret;
+	return 0;
+}
+
 static int bma400_set_power_mode(struct bma400_data *data,
 				 enum bma400_power_mode mode)
 {
@@ -629,6 +674,10 @@ static int bma400_init(struct bma400_data *data)
 		goto err_reg_disable;
 
 	ret = bma400_get_accel_scale(data);
+	if (ret)
+		goto err_reg_disable;
+
+	ret = bma400_int_drdy_config(data);
 	if (ret)
 		goto err_reg_disable;
 
@@ -786,11 +835,114 @@ static int bma400_write_raw_get_fmt(struct iio_dev *indio_dev,
 	}
 }
 
+static const unsigned long bma400_scan_masks[] = {
+	GENMASK(3, 0),
+	0,
+};
+
 static const struct iio_info bma400_info = {
 	.read_raw          = bma400_read_raw,
 	.read_avail        = bma400_read_avail,
 	.write_raw         = bma400_write_raw,
 	.write_raw_get_fmt = bma400_write_raw_get_fmt,
+};
+
+static int bma400_drdy(struct bma400_data *data)
+{
+	int ret, tries = 100;
+	unsigned int status;
+
+	while (tries--) {
+		ret = regmap_read(data->regmap, BMA400_INT_STAT0_REG,
+				  &status);
+		if (ret)
+			return ret;
+
+		if (status & BMA400_INT_DRDY_MSK)
+			return 0;
+
+		msleep(20);
+	}
+	return -EIO;
+}
+static irqreturn_t bma400_trigger_handler(int irq, void *p)
+{
+	struct iio_poll_func *pf = p;
+	struct iio_dev *indio_dev = pf->indio_dev;
+	struct bma400_data *data = iio_priv(indio_dev);
+	int ret,temp;
+	
+	mutex_lock(&data->mutex);
+	
+	ret = bma400_drdy(data);
+	if (ret)
+		goto out;
+
+	/* bulk read six registers, with the base being the LSB register */
+	ret = regmap_bulk_read(data->regmap, BMA400_X_AXIS_LSB_REG,
+			       &data->buffer.buff, 3 * sizeof(__be16));
+	if (ret)
+		goto out;
+			
+	ret = regmap_read(data->regmap, BMA400_TEMP_DATA_REG,
+			  &temp); //&data->buffer.temperature);
+	if (ret)
+		goto out;
+	data->buffer.temperature = temp;	
+/*
+	//for(int i = 0; i < 3; i++) 
+	{
+		dev_info(&indio_dev->dev,"%d %d %d %d\n",data->buffer.buff[0]
+						     ,data->buffer.buff[1]
+						     ,data->buffer.buff[2]
+						     ,data->buffer.temperature);
+	}
+*/
+	iio_push_to_buffers_with_timestamp(indio_dev, &data->buffer,
+					   iio_get_time_ns(indio_dev));
+
+out:
+	mutex_unlock(&data->mutex);
+	iio_trigger_notify_done(indio_dev->trig);
+
+        return IRQ_HANDLED;
+}
+
+static irqreturn_t bma400_irq_handler(int irq, void *private)
+{
+        struct iio_dev *indio_dev = private;
+
+        dev_info(&indio_dev->dev,"irq = %d is fired\n",irq);
+        return IRQ_WAKE_THREAD;
+}
+
+static int bma400_data_rdy_trigger_set_state(struct iio_trigger *trig,
+                                             bool state)
+{
+        struct iio_dev *indio_dev = iio_trigger_get_drvdata(trig);
+        struct bma400_data *data = iio_priv(indio_dev);
+
+/*
+        int ret;
+        if (state) {
+                regmap_write(data->regmap, BMA400_INT_CONFIG1_REG, 0x80);
+                dev_info(data->dev,"BMA400 int1 configured\n");
+        }
+        else {
+                regmap_write(data->regmap, BMA400_INT_CONFIG1_REG, 0x00);
+                dev_info(data->dev,"BMA400 int1 disabled\n");
+        }
+        return 0;
+*/
+	return regmap_update_bits(data->regmap, BMA400_INT1_MAP_REG,
+			BMA400_INT_DRDY_MSK,
+			FIELD_PREP(BMA400_INT_DRDY_MSK,
+				state));
+}
+
+static const struct iio_trigger_ops bma400_trigger_ops = {
+        .set_trigger_state = &bma400_data_rdy_trigger_set_state,
+        .validate_device = &iio_trigger_validate_own_device,
 };
 
 static void bma400_disable(void *data_ptr)
@@ -806,7 +958,7 @@ static void bma400_disable(void *data_ptr)
 	regulator_bulk_disable(ARRAY_SIZE(data->regulators), data->regulators);
 }
 
-int bma400_probe(struct device *dev, struct regmap *regmap, const char *name)
+int bma400_probe(struct device *dev, struct regmap *regmap, int irq, const char *name)
 {
 	struct iio_dev *indio_dev;
 	struct bma400_data *data;
@@ -833,13 +985,49 @@ int bma400_probe(struct device *dev, struct regmap *regmap, const char *name)
 	indio_dev->info = &bma400_info;
 	indio_dev->channels = bma400_channels;
 	indio_dev->num_channels = ARRAY_SIZE(bma400_channels);
+	indio_dev->available_scan_masks = bma400_scan_masks;
 	indio_dev->modes = INDIO_DIRECT_MODE;
 
 	//dev_set_drvdata(dev, indio_dev);
         ret = devm_add_action_or_reset(dev, bma400_disable, data);
-        if (ret < 0)
+        if (ret)
                 return ret;
+	
+        ret = devm_iio_triggered_buffer_setup(dev, indio_dev,
+                                              &iio_pollfunc_store_time,
+                                              &bma400_trigger_handler, NULL);
+        if (ret) {
+		dev_err(dev, "iio triggered buffer setup failed\n");
+                return ret;
+	}
+	if (irq > 0) {
+		data->trig = devm_iio_trigger_alloc(dev, "%s-dev%d",
+						    indio_dev->name,
+						    iio_device_id(indio_dev));
+		if (!data->trig)
+			return -ENOMEM;
 
+		data->trig->ops = &bma400_trigger_ops;
+		iio_trigger_set_drvdata(data->trig, indio_dev);
+
+		ret = devm_iio_trigger_register(data->dev, data->trig);
+		if (ret) {
+			dev_err(dev, "iio trigger register failed\n");
+			return ret;
+		}
+		indio_dev->trig = iio_trigger_get(data->trig);
+
+		ret = devm_request_threaded_irq(dev, irq,
+						iio_trigger_generic_data_rdy_poll, //bma400_irq_handler,
+						NULL,
+						IRQF_TRIGGER_RISING | IRQF_ONESHOT,
+						indio_dev->name, data->trig);
+		if (ret) {
+			dev_err(dev, "request irq %d failed\n", irq);
+			return ret;
+		}
+
+	}
 	return devm_iio_device_register(dev, indio_dev);
 }
 EXPORT_SYMBOL(bma400_probe);
