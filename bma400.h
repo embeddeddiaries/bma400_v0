@@ -66,6 +66,7 @@
 #define BMA400_INT_CONFIG0_REG      0x1f
 #define BMA400_INT_CONFIG1_REG      0x20
 #define BMA400_INT1_MAP_REG         0x21
+#define BMA400_INT12_MAP_REG	    0x23
 #define BMA400_INT_IO_CTRL_REG	    0x24
 #define BMA400_INT_DRDY_MSK	    BIT(7)
 

@@ -26,6 +26,7 @@
 #include <linux/iio/trigger.h>
 #include <linux/iio/triggered_buffer.h>
 #include <linux/iio/trigger_consumer.h>
+#include <linux/iio/events.h>
 
 #include "bma400.h"
 
@@ -69,6 +70,7 @@ struct bma400_data {
 	int scale;
 	struct iio_trigger *trig;
 	int steps_enabled;
+	s64 event_timestamp;
 	/* Correct time stamp alignment */
 	struct {
 		__be16 buff[3];
@@ -166,6 +168,12 @@ static const struct iio_chan_spec_ext_info bma400_ext_info[] = {
 	{ }
 };
 
+static const struct iio_event_spec bma400_step_detect_event = {
+	.type = IIO_EV_TYPE_CHANGE,
+	.dir = IIO_EV_DIR_NONE,
+	.mask_separate = BIT(IIO_EV_INFO_ENABLE),
+};
+
 #define BMA400_ACC_CHANNEL(_index, _axis) { \
 	.type = IIO_ACCEL, \
 	.modified = 1, \
@@ -208,6 +216,8 @@ static const struct iio_chan_spec bma400_channels[] = {
 		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
 		.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_ENABLE),
 		.scan_index = -1, /* No buffer support */
+		.event_spec = &bma400_step_detect_event,
+		.num_event_specs = 1,
 	},
 	IIO_CHAN_SOFT_TIMESTAMP(4),
 };
@@ -723,7 +733,7 @@ static int bma400_read_raw(struct iio_dev *indio_dev,
 					       &step_raw, (3 * sizeof(u8)));
 			*val = (steps_raw[2] << 16) | (steps_raw[1] << 8) | (steps_raw[0]);
 			*/
-			if (ret < 0)
+			if (ret)
 				return ret;
 			*val = steps_raw & 0x00FFFFFF;
 			return IIO_VAL_INT;
@@ -850,7 +860,7 @@ static int bma400_write_raw(struct iio_dev *indio_dev,
 		ret = regmap_update_bits(data->regmap, BMA400_INT_CONFIG1_REG,
 					 BMA400_STEP_INT_MSK,
 					 FIELD_PREP(BMA400_STEP_INT_MSK, !!val));
-		if (ret < 0) {
+		if (ret) {
 			mutex_unlock(&data->mutex);
 			return ret;
 		}
@@ -880,6 +890,52 @@ static int bma400_write_raw_get_fmt(struct iio_dev *indio_dev,
 	}
 }
 
+int iio_simple_dummy_read_event_config(struct iio_dev *indio_dev,
+                                       const struct iio_chan_spec *chan,
+                                       enum iio_event_type type,
+                                       enum iio_event_direction dir)
+{
+        struct bma400_data *data = iio_priv(indio_dev);
+
+        return 0;
+}
+
+int iio_simple_dummy_write_event_config(struct iio_dev *indio_dev,
+                                        const struct iio_chan_spec *chan,
+                                        enum iio_event_type type,
+                                        enum iio_event_direction dir,
+                                        int state)
+{
+	int ret;
+	struct bma400_data *data = iio_priv(indio_dev);
+
+        switch (chan->type) {
+        case IIO_STEPS:
+                switch (type) {
+                case IIO_EV_TYPE_CHANGE:
+			mutex_lock(&data->mutex);
+			ret = regmap_update_bits(data->regmap,
+						 BMA400_INT12_MAP_REG,
+						 BMA400_STEP_INT_MSK,
+						 FIELD_PREP(BMA400_STEP_INT_MSK,
+						 state));
+
+			mutex_unlock(&data->mutex);
+			if (ret)
+				return ret;
+
+
+                        break;
+                default:
+                        return -EINVAL;
+                }
+                break;
+        default:
+                return -EINVAL;
+        }
+
+        return 0;
+}
 static const unsigned long bma400_scan_masks[] = {
 	GENMASK(3, 0),
 	0,
@@ -890,6 +946,8 @@ static const struct iio_info bma400_info = {
 	.read_avail        = bma400_read_avail,
 	.write_raw         = bma400_write_raw,
 	.write_raw_get_fmt = bma400_write_raw_get_fmt,
+        .read_event_config = &iio_simple_dummy_read_event_config,
+        .write_event_config = &iio_simple_dummy_write_event_config,
 };
 
 static int bma400_drdy(struct bma400_data *data)
@@ -917,6 +975,7 @@ static irqreturn_t bma400_trigger_handler(int irq, void *p)
 	struct bma400_data *data = iio_priv(indio_dev);
 	int ret,temp;
 	
+        dev_info(&indio_dev->dev,"%s irq = %d is fired\n", __func__, irq);
 	mutex_lock(&data->mutex);
 	
 	ret = bma400_drdy(data);
@@ -956,11 +1015,50 @@ out:
 static irqreturn_t bma400_irq_handler(int irq, void *private)
 {
         struct iio_dev *indio_dev = private;
+        struct bma400_data *data = iio_priv(indio_dev);
+	int ret;
+	
+//	iio_trigger_poll(data->trig);
+//      return IRQ_HANDLED;
 
-        dev_info(&indio_dev->dev,"irq = %d is fired\n",irq);
+        data->event_timestamp = iio_get_time_ns(indio_dev);
+        dev_info(&indio_dev->dev,"%s irq = %d is fired\n", __func__, irq);
         return IRQ_WAKE_THREAD;
 }
 
+static irqreturn_t bma400_event_handler(int irq, void *private)
+{
+        struct iio_dev *indio_dev = private;
+	struct bma400_data *data = iio_priv(indio_dev);
+	int ret;
+	unsigned int status;
+
+	iio_trigger_poll_chained(data->trig);
+        dev_info(&indio_dev->dev,"%s irq = %d is fired\n", __func__, irq);
+        //return IRQ_HANDLED;
+
+	#if 0
+	mutex_lock(&data->mutex);
+	ret = regmap_read(data->regmap, BMA400_INT_STAT1_REG, &status);
+	if(ret)
+		goto out;
+	dev_info(&indio_dev->dev, "Reg id %s event %x\n","BMA400_INT_STAT1_REG",
+		status & 0x03);
+
+	ret = regmap_read(data->regmap, BMA400_STEP_STAT_REG, &status);
+	if(ret)
+		goto out;
+	dev_info(&indio_dev->dev, "Reg id %s event %x\n","BMA400_STEP_STAT_REG",
+		status & 0x03);
+
+	iio_push_event(indio_dev, IIO_EVENT_CODE(IIO_STEPS, 0, IIO_NO_MOD,
+		       IIO_EV_DIR_NONE,IIO_EV_TYPE_CHANGE, 0, 0, 0),
+		       data->event_timestamp);
+out:
+	mutex_unlock(&data->mutex);
+#endif
+	return IRQ_HANDLED;
+}
 static int bma400_data_rdy_trigger_set_state(struct iio_trigger *trig,
                                              bool state)
 {
@@ -1037,14 +1135,7 @@ int bma400_probe(struct device *dev, struct regmap *regmap, int irq, const char 
         ret = devm_add_action_or_reset(dev, bma400_disable, data);
         if (ret)
                 return ret;
-	
-        ret = devm_iio_triggered_buffer_setup(dev, indio_dev,
-                                              &iio_pollfunc_store_time,
-                                              &bma400_trigger_handler, NULL);
-        if (ret) {
-		dev_err(dev, "iio triggered buffer setup failed\n");
-                return ret;
-	}
+#if 1	
 	if (irq > 0) {
 		data->trig = devm_iio_trigger_alloc(dev, "%s-dev%d",
 						    indio_dev->name,
@@ -1063,19 +1154,39 @@ int bma400_probe(struct device *dev, struct regmap *regmap, int irq, const char 
 		indio_dev->trig = iio_trigger_get(data->trig);
 
 		ret = devm_request_threaded_irq(dev, irq,
-						iio_trigger_generic_data_rdy_poll, //bma400_irq_handler,
-						NULL,
+						&bma400_irq_handler, //iio_trigger_generic_data_rdy_poll,
+						&bma400_event_handler, //NULL
 						IRQF_TRIGGER_RISING | IRQF_ONESHOT,
-						indio_dev->name, data->trig);
+						indio_dev->name, indio_dev);
 		if (ret) {
 			dev_err(dev, "request irq %d failed\n", irq);
 			return ret;
 		}
-
+#endif
+#if 0
+		ret = devm_request_threaded_irq(dev, irq,
+						&bma400_irq_handler, //iio_trigger_generic_data_rdy_poll,
+						&bma400_event_handler, //NULL
+						IRQF_TRIGGER_RISING | IRQF_ONESHOT,
+						indio_dev->name, indio_dev);
+		if (ret) {
+			dev_err(dev, "request irq %d failed\n", irq);
+			return ret;
+		}
+#endif
 	}
+	ret = devm_iio_triggered_buffer_setup(dev, indio_dev,
+			NULL, //&iio_pollfunc_store_time,
+			&bma400_trigger_handler, NULL);
+	if (ret) {
+		dev_err(dev, "iio triggered buffer setup failed\n");
+		return ret;
+	}
+
+	//}
 	return devm_iio_device_register(dev, indio_dev);
 }
-EXPORT_SYMBOL(bma400_probe);
+EXPORT_SYMBOL_GPL(bma400_probe);
 
 /*
 void bma400_remove(struct device *dev)
