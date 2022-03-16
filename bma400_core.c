@@ -694,10 +694,11 @@ static int bma400_init(struct bma400_data *data)
 	if (ret)
 		goto err_reg_disable;
 
-	ret = bma400_int_drdy_config(data);
+	//ret = bma400_int_drdy_config(data);
+	ret = regmap_write(data->regmap, BMA400_INT_IO_CTRL_REG, 0x02);
+	
 	if (ret)
 		goto err_reg_disable;
-
 	/*
 	 * Once the interrupt engine is supported we might use the
 	 * data_src_reg, but for now ensure this is set to the
@@ -977,11 +978,11 @@ static irqreturn_t bma400_trigger_handler(int irq, void *p)
 	
         dev_info(&indio_dev->dev,"%s irq = %d is fired\n", __func__, irq);
 	mutex_lock(&data->mutex);
-	
+/*	
 	ret = bma400_drdy(data);
 	if (ret)
 		goto out;
-
+*/
 	/* bulk read six registers, with the base being the LSB register */
 	ret = regmap_bulk_read(data->regmap, BMA400_X_AXIS_LSB_REG,
 			       &data->buffer.buff, 3 * sizeof(__be16));
@@ -1031,32 +1032,51 @@ static irqreturn_t bma400_event_handler(int irq, void *private)
         struct iio_dev *indio_dev = private;
 	struct bma400_data *data = iio_priv(indio_dev);
 	int ret;
-	unsigned int status;
+	__le16 status;
+	unsigned int act;
 
-	iio_trigger_poll_chained(data->trig);
         dev_info(&indio_dev->dev,"%s irq = %d is fired\n", __func__, irq);
-        //return IRQ_HANDLED;
+//	iio_trigger_poll_chained(data->trig);
+  //      return IRQ_HANDLED;
 
-	#if 0
 	mutex_lock(&data->mutex);
+	ret = regmap_bulk_read(data->regmap, BMA400_INT_STAT0_REG, &status, 
+			       sizeof(status));
+	mutex_unlock(&data->mutex);
+	if(ret)
+		goto out;
+
+	if(status & BMA400_INT_DRDY_MSK)
+		iio_trigger_poll_chained(data->trig);
+
+	#if 1
+/*
+	ret = regmap_read(data->regmap, BMA400_INT_STAT0_REG, &status);
+	if(ret)
+		goto out;
+
 	ret = regmap_read(data->regmap, BMA400_INT_STAT1_REG, &status);
 	if(ret)
 		goto out;
-	dev_info(&indio_dev->dev, "Reg id %s event %x\n","BMA400_INT_STAT1_REG",
-		status & 0x03);
+*/
 
-	ret = regmap_read(data->regmap, BMA400_STEP_STAT_REG, &status);
-	if(ret)
-		goto out;
-	dev_info(&indio_dev->dev, "Reg id %s event %x\n","BMA400_STEP_STAT_REG",
-		status & 0x03);
+	if(status & (0x03 << 8)) {
+		dev_info(&indio_dev->dev, "Reg id %s event %x\n","BMA400_INT_STAT1_REG",
+				status & 0x03);
 
-	iio_push_event(indio_dev, IIO_EVENT_CODE(IIO_STEPS, 0, IIO_NO_MOD,
-		       IIO_EV_DIR_NONE,IIO_EV_TYPE_CHANGE, 0, 0, 0),
-		       data->event_timestamp);
-out:
-	mutex_unlock(&data->mutex);
+		ret = regmap_read(data->regmap, BMA400_STEP_STAT_REG, &act);
+		if(ret)
+			goto out;
+
+		dev_info(&indio_dev->dev, "Reg id %s event %x\n","BMA400_STEP_STAT_REG",
+				act & 0x03);
+
+		iio_push_event(indio_dev, IIO_EVENT_CODE(IIO_STEPS, 0, IIO_NO_MOD,
+					IIO_EV_DIR_NONE,IIO_EV_TYPE_CHANGE, 0, 0, 0),
+				data->event_timestamp);
+	}
 #endif
+out:
 	return IRQ_HANDLED;
 }
 static int bma400_data_rdy_trigger_set_state(struct iio_trigger *trig,
@@ -1064,7 +1084,7 @@ static int bma400_data_rdy_trigger_set_state(struct iio_trigger *trig,
 {
         struct iio_dev *indio_dev = iio_trigger_get_drvdata(trig);
         struct bma400_data *data = iio_priv(indio_dev);
-
+	int ret;
 /*
         int ret;
         if (state) {
@@ -1075,12 +1095,21 @@ static int bma400_data_rdy_trigger_set_state(struct iio_trigger *trig,
                 regmap_write(data->regmap, BMA400_INT_CONFIG1_REG, 0x00);
                 dev_info(data->dev,"BMA400 int1 disabled\n");
         }
-        return 0;
 */
-	return regmap_update_bits(data->regmap, BMA400_INT1_MAP_REG,
-			BMA400_INT_DRDY_MSK,
-			FIELD_PREP(BMA400_INT_DRDY_MSK,
-				state));
+	ret = regmap_update_bits(data->regmap, BMA400_INT_CONFIG0_REG,
+                                 BMA400_INT_DRDY_MSK,
+                                 FIELD_PREP(BMA400_INT_DRDY_MSK, state));
+	//ret = regmap_write(data->regmap, BMA400_INT_CONFIG0_REG, 0x80);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(data->regmap, BMA400_INT1_MAP_REG,
+				  BMA400_INT_DRDY_MSK,
+				  FIELD_PREP(BMA400_INT_DRDY_MSK, state));
+	if (ret)
+		return ret;
+
+        return 0;
 }
 
 static const struct iio_trigger_ops bma400_trigger_ops = {
@@ -1154,7 +1183,7 @@ int bma400_probe(struct device *dev, struct regmap *regmap, int irq, const char 
 		indio_dev->trig = iio_trigger_get(data->trig);
 
 		ret = devm_request_threaded_irq(dev, irq,
-						&bma400_irq_handler, //iio_trigger_generic_data_rdy_poll,
+						NULL, //&bma400_irq_handler, //iio_trigger_generic_data_rdy_poll,
 						&bma400_event_handler, //NULL
 						IRQF_TRIGGER_RISING | IRQF_ONESHOT,
 						indio_dev->name, indio_dev);
